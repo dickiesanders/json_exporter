@@ -143,7 +143,7 @@ class Rule(object):
         self.static_label_keys = static_label_keys
         self.static_label_values = static_label_values
         self.label_parsers = label_parsers
-        self.regex = regex
+        self.regex = re.compile(regex)
 
     def __str__(self):
         return 'name=%s target=%s object_path=%s metric_path=%s static_label_keys=%r static_label_values=%r dynamic_labels=%r regex=%s' % (
@@ -153,7 +153,7 @@ class Rule(object):
             self.metric_path,
             self.static_label_keys,
             self.static_label_values,
-            self.label_parsers.keys(),
+            list(self.label_parsers.keys()),
             self.regex.pattern)
 
     def match_regex(self, path):
@@ -168,32 +168,61 @@ class Rule(object):
         for match in self.metric_parser.find(data):
             try:
                 if match.value is None:
-                    value = NAN
+                    value = float('NaN')
                 else:
                     value = float(str(match.value))
             except ValueError:
-                debug('target %s, rule %s, skipping value %s for path %s (not a number)',
-                      self.target_name, self.name, match.value, match.full_path)
-                continue
+                continue  # Skipping non-numeric values
             yield (match, value)
+
+    def regex_replace(self, value, pattern, replacement):
+        try:
+            return re.sub(pattern, replacement, value)
+        except re.error as e:
+            return value
+
+    def regex_extract(self, value, pattern):
+        try:
+            match = re.search(pattern, value)
+            if match:
+                return match.group(1)
+            return ''
+        except re.error as e:
+            return ''
+
+    def interpret_expression(self, expression, obj):
+        if "regex_replace" in expression:
+            parts = expression.split(", ")
+            jsonpath_expr = parts[0].split("regex_replace(")[1]
+            pattern = parts[1]
+            replacement = parts[2].rstrip(")")
+            matches = parse(jsonpath_expr).find(obj)
+            if matches:
+                value = matches[0].value
+                return self.regex_replace(value, pattern, replacement)
+        elif "regex_extract" in expression:
+            parts = expression.split(", ")
+            jsonpath_expr = parts[0].split("regex_extract(")[1]
+            pattern = parts[1].rstrip(")")
+            matches = parse(jsonpath_expr).find(obj)
+            if matches:
+                value = matches[0].value
+                return self.regex_extract(value, pattern)
+        else:  # Fallback to treating as a regular JSONPath expression
+            matches = parse(expression).find(obj)
+            if matches:
+                return matches[0].value
+        return ''
 
     def get_dynamic_labels(self, obj):
         'Find all dynamic labels from jsonpath match obj.'
         if not self.label_parsers:
             return [], []
         dynamic_labels = {}
-        for label in self.label_parsers:
-            res = [match.value for match in self.label_parsers[label].find(obj)]
-            if len(res) != 1:
-                warn('target %s, rule %s, dynamic label "%s" returned %d matches instead of 1 for object path %s',
-                     self.target_name, self.name, label, len(res), obj.full_path)
-                dynamic_labels[label] = ""
-            elif not isinstance(res[0], str):
-                warn('target %s, rule %s, dynamic label "%s" returned non-string value %r for object path %s',
-                     self.target_name, self.name, label, res[0], obj.full_path)
-                dynamic_labels[label] = ""
-            else:
-                dynamic_labels[label] = res[0]
+        for label, expression in self.label_parsers.items():
+            value = self.interpret_expression(expression, obj)
+            if value:
+                dynamic_labels[label] = value
         dynamic_label_keys = sorted(dynamic_labels)
         dynamic_label_values = [dynamic_labels[label] for label in dynamic_label_keys]
 
@@ -209,10 +238,9 @@ class Rule(object):
             for match, value in self.get_metrics(obj):
                 metric_path = str(match.full_path)
                 re_variables = self.match_regex(metric_path)
-                metric_name = get_metric_name(render(self.name, re_variables))
-                debug('create metric_name %s from metric_path %s with value %s', metric_name, metric_path, value)
+                metric_name = re.sub(r'[^0-9a-zA-Z_:]', '_', self.name.format(**re_variables))
                 metric_help = 'from %s' % metric_path
-                key = tuple((metric_name, labels))
+                key = (metric_name, labels)
                 if key not in cache:
                     cache[key] = self.family(metric_name, metric_help, labels=labels)
 
